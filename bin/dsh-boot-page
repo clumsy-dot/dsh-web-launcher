@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+// 启动进度页：在服务就绪前给浏览器一个即时反馈，就绪后自动跳到 DSH Web。
+// 用法：dsh-boot-page <端口> <ready 文件>
+//   ready 文件内容为空 → 还在启动
+//   http://...        → 就绪，跳转过去
+//   ERR:消息           → 启动失败
+const http = require('http')
+const fs = require('fs')
+
+const port = Number(process.argv[2])
+const readyFile = process.argv[3] || ''
+
+const HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>正在启动 DSH Web…</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font: 15px/1.6 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+    background: radial-gradient(1200px 800px at 50% -10%, #eef2ff 0%, #f7f8fc 45%, #ffffff 100%);
+    color: #1f2430;
+  }
+  .card {
+    text-align: center; padding: 44px 52px; border-radius: 24px;
+    background: rgba(255,255,255,.72); border: 1px solid rgba(20,30,60,.08);
+    box-shadow: 0 24px 60px rgba(30,50,120,.10); backdrop-filter: blur(12px);
+  }
+  .whale { font-size: 44px; line-height: 1; }
+  h1 { margin: 14px 0 6px; font-size: 20px; font-weight: 600; letter-spacing: .2px; }
+  p { margin: 0; color: #6b7385; font-size: 13.5px; }
+  .bar { margin: 22px auto 0; width: 190px; height: 3px; border-radius: 3px; overflow: hidden; background: rgba(60,90,200,.12); }
+  .bar i { display: block; height: 100%; width: 40%; border-radius: 3px;
+    background: linear-gradient(90deg, #4b6bff, #00c9b4); animation: slide 1.5s ease-in-out infinite; }
+  @keyframes slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(360%); } }
+  .err { margin-top: 18px; color: #c0392b; font-size: 13px; white-space: pre-wrap; text-align: left; max-width: 460px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: radial-gradient(1200px 800px at 50% -10%, #1a2340 0%, #12151f 45%, #0d0f16 100%); color: #e8ecf6; }
+    .card { background: rgba(30,36,52,.72); border-color: rgba(255,255,255,.08); box-shadow: 0 24px 60px rgba(0,0,0,.45); }
+    p { color: #9aa3b8; }
+    .bar { background: rgba(255,255,255,.1); }
+  }
+</style></head>
+<body><div class="card">
+  <div class="whale">🐋</div>
+  <h1>正在启动 DSH Web</h1>
+  <p>首次启动要加载插件，通常 20~60 秒；就绪后会自动跳转。</p>
+  <div class="bar"><i></i></div>
+  <div class="err" id="err" hidden></div>
+</div>
+<script>
+  var started = Date.now();
+  var errEl = document.getElementById('err');
+  // 兜底：页面在等太久时自己刷新一次，避免旧窗口卡在过期状态
+  setTimeout(function () { location.reload() }, 120000);
+  var staging = false;
+  function tick() {
+    fetch('/status', { cache: 'no-store' }).then(function (r) { return r.json() }).then(function (s) {
+      if (s.ready && s.url) {
+        if (s.staged) {
+          if (!staging) {
+            staging = true;
+            var h = document.querySelector('h1');
+            var p = document.querySelector('p');
+            if (h) h.textContent = '正在打开 DSH Web';
+            if (p) p.textContent = '界面在后台加载，准备好会自动切过来。';
+            setTimeout(function () { location.replace(s.url) }, 30000);
+          }
+          setTimeout(tick, 1000);
+          return;
+        }
+        location.replace(s.url); return;
+      }
+      if (s.error) {
+        errEl.hidden = false;
+        errEl.textContent = '启动失败：' + s.error + '\\n后台会自动重试；也可以关掉这扇窗口重新双击 DSH Web。';
+        setTimeout(tick, 2000);   // 继续轮询：下一次启动成功后能自己恢复
+        return;
+      }
+      errEl.hidden = true;
+      setTimeout(tick, 600);
+    }).catch(function () { setTimeout(tick, 1200) });
+  }
+  tick();
+</script></body></html>`
+
+const server = http.createServer((req, res) => {
+  if (req.url && req.url.indexOf('/status') === 0) {
+    let raw = ''
+    try {
+      raw = fs.readFileSync(readyFile, 'utf8').trim()
+    } catch (e) {
+      raw = ''
+    }
+    let body
+    let staged = false
+    if (raw.indexOf('STAGED|') === 0) {
+      staged = true
+      raw = raw.slice(7)
+    }
+    if (raw.indexOf('ERR:') === 0) body = { ready: false, url: null, error: raw.slice(4) }
+    else if (raw) body = { ready: true, url: raw, staged }
+    else body = { ready: false, url: null }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(body))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(HTML)
+})
+
+server.on('error', () => process.exit(1))
+server.listen(port, '127.0.0.1', () => {
+  // 最多活 15 分钟，避免启动器异常退出后残留
+  const killer = setTimeout(() => process.exit(0), 15 * 60 * 1000)
+  killer.unref()
+})

@@ -1,0 +1,440 @@
+#!/bin/bash
+# ===========================================================================
+#  DSH Web 一键启动（macOS）
+#
+#  等价于在终端里执行：
+#      npx @deepseek-ai/dsh web
+#
+#  额外帮你处理：
+#    * 双击启动时 PATH 里找不到 node / npx
+#    * 3080 端口被占用（自动换一个空闲端口）
+#    * 服务还没起来就打开浏览器（等真正能访问了再开）
+#    * 已经启动过就只开浏览器，不重复起实例（--new 可强制新开）
+#    * 关闭窗口 / Ctrl-C 时把后端进程一起收掉
+#    * 日志落盘，出问题能回看
+#
+#  用法：
+#      dsh-web                    使用默认端口 3080 启动
+#      dsh-web --port 8090
+#      dsh-web --workspace ~/code
+#      dsh-web --new              忽略已在运行的实例，另起一个
+#      dsh-web --check            只体检，不启动
+#      dsh-web --help
+# ===========================================================================
+set -uo pipefail
+
+APP_NAME="DSH Web"
+VERSION="1.0.0"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ---------------------------------------------------------------- 可配置项 ---
+PKG_SPEC="${DSH_PKG_SPEC:-@deepseek-ai/dsh}"   # 想锁版本就写 @deepseek-ai/dsh@0.2.2-rc.1
+PORT="${DSH_WEB_PORT:-3080}"
+HOST="${DSH_WEB_HOST:-127.0.0.1}"
+BOOT_TIMEOUT="${DSH_WEB_BOOT_TIMEOUT:-300}"    # 首次 npx 要下载依赖，给足时间
+WORKSPACE="${DSH_WEB_WORKSPACE:-}"
+NPX_BIN="${DSH_WEB_NPX:-npx}"
+NO_OPEN="${DSH_WEB_NO_OPEN:-0}"
+REUSE="${DSH_WEB_REUSE:-1}"
+CHECK_ONLY=0
+
+# ---------------------------------------------------------------- 小工具 ---
+if [ -t 1 ]; then
+  C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'; C_CYN=$'\033[36m'; C_RST=$'\033[0m'; C_BLD=$'\033[1m'
+else
+  C_DIM=''; C_RED=''; C_GRN=''; C_YEL=''; C_CYN=''; C_RST=''; C_BLD=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s %s\n' "${C_CYN}·${C_RST}" "$*"; }
+ok()   { printf '%s %s\n' "${C_GRN}✓${C_RST}" "$*"; }
+warn() { printf '%s %s\n' "${C_YEL}!${C_RST}" "$*" >&2; }
+die()  { printf '%s %s\n' "${C_RED}✗${C_RST}" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+${C_BLD}${APP_NAME} v${VERSION}${C_RST}
+一键启动 DeepSeek Harness 的 Web 界面（npx @deepseek-ai/dsh web）
+
+用法：dsh-web [选项]
+
+  --port <端口>        监听端口，默认 ${PORT}
+  --host <地址>        监听地址，默认 ${HOST}
+  --workspace <目录>   在这个目录启动（作为工作区），默认见下
+  --no-open            启动后不自动打开浏览器
+  --new                已在运行也另起一个实例（自动换端口）
+  --timeout <秒>       等待服务就绪的最长时间，默认 ${BOOT_TIMEOUT}
+  --check              只打印环境体检结果，不启动
+  -h, --help           显示本帮助
+
+环境变量：DSH_PKG_SPEC、DSH_WEB_PORT、DSH_WEB_HOST、DSH_WEB_WORKSPACE、
+          DSH_WEB_NO_OPEN、DSH_WEB_REUSE、DSH_WEB_BOOT_TIMEOUT、DSH_WEB_LOG_DIR
+
+默认工作区：~/Documents/deepseek-harness/default-workspace（不存在则用 ~）
+日志：~/.dsh-web-launcher/logs/
+EOF
+}
+
+# ---------------------------------------------------------------- 参数解析 ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port)        PORT="${2:?--port 需要参数}"; shift 2 ;;
+    --port=*)      PORT="${1#*=}"; shift ;;
+    --host)        HOST="${2:?--host 需要参数}"; shift 2 ;;
+    --host=*)      HOST="${1#*=}"; shift ;;
+    --workspace)   WORKSPACE="${2:?--workspace 需要参数}"; shift 2 ;;
+    --workspace=*) WORKSPACE="${1#*=}"; shift ;;
+    --timeout)     BOOT_TIMEOUT="${2:?--timeout 需要参数}"; shift 2 ;;
+    --timeout=*)   BOOT_TIMEOUT="${1#*=}"; shift ;;
+    --no-open)     NO_OPEN=1; shift ;;
+    --new)         REUSE=0; shift ;;
+    --check)       CHECK_ONLY=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             die "未知参数：$1（用 --help 查看用法）" ;;
+  esac
+done
+
+[[ "$PORT" =~ ^[0-9]+$ ]] || die "端口必须是数字，收到：$PORT"
+[[ "$BOOT_TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout 必须是数字，收到：$BOOT_TIMEOUT"
+
+# ---------------------------------------------------------------- 环境准备 ---
+# 从 Finder / Dock 启动时 PATH 极短，这里补齐常见安装位置。
+export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$HOME/.volta/bin:$HOME/.bun/bin:$HOME/.deno/bin:$PATH"
+
+if ! command -v node >/dev/null 2>&1 && [ -s "$HOME/.nvm/nvm.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
+  nvm use --silent default >/dev/null 2>&1 || nvm use --silent node >/dev/null 2>&1 || true
+fi
+
+have_node=0; command -v node >/dev/null 2>&1 && have_node=1
+node_ver="$(node -v 2>/dev/null || echo '未安装')"
+node_ok=0
+if [ "$have_node" = 1 ]; then
+  node_ok="$(node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.stdout.write(a>24||(a===24&&b>=9)?"1":"0")' 2>/dev/null || echo 0)"
+fi
+
+default_workspace() {
+  local c="$HOME/Documents/deepseek-harness/default-workspace"
+  if [ -d "$c" ]; then printf '%s' "$c"; else printf '%s' "$HOME"; fi
+}
+[ -n "$WORKSPACE" ] || WORKSPACE="$(default_workspace)"
+
+# ---------------------------------------------------------------- 网络探测 ---
+port_open() {  # 端口上有没有人在听
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+}
+
+http_code() {  # 返回 HTTP 状态码，连不上返回 000
+  local c
+  if command -v curl >/dev/null 2>&1; then
+    c="$(curl -sS -m 2 -o /dev/null -w '%{http_code}' "http://$1:$2/" 2>/dev/null)" || c=''
+  fi
+  case "$c" in 1??|2??|3??|4??|5??) ;; *) c='000' ;; esac
+  printf '%s' "$c"
+}
+
+is_dsh_service() {  # $1 host, $2 port, $3 http code —— 确认对面是 DSH Web 而不是别的程序
+  case "$3" in 2??|3??) return 0 ;; esac
+  # 没带 token 访问时 dsh 会回 401，正文固定写着 “dsh web authentication required”
+  if command -v curl >/dev/null 2>&1; then
+    curl -sS -m 2 "http://$1:$2/" 2>/dev/null | grep -qi 'dsh web' && return 0
+  fi
+  return 1
+}
+
+# dsh web 启动时会打印 “dsh web: http://127.0.0.1:端口/?token=…”，
+# 这个带 token 的地址才能换到浏览器 cookie，必须用它来开页面。
+printed_url() {
+  [ -s "$1" ] || return 0
+  sed -n 's/^[[:space:]]*dsh web:[[:space:]]*\(http[^[:space:]]*\).*/\1/p' "$1" 2>/dev/null | tail -n 1
+}
+
+
+free_port() {  # 从 $1 往后找一个空端口
+  local p="$1"
+  while [ "$p" -le 65535 ]; do
+    port_open "$p" || { printf '%s' "$p"; return 0; }
+    p=$((p + 1))
+  done
+  return 1
+}
+
+open_browser() {  # $1 = 要打开的完整地址
+  if [ "$NO_OPEN" = 1 ]; then
+    info "已跳过自动打开浏览器（--no-open）"
+    return 0
+  fi
+  if [ -x "$SELF_DIR/dsh-open" ] && "$SELF_DIR/dsh-open" "$1" >/dev/null 2>&1; then
+    ok "已在 DSH 专属窗口打开"
+  elif command -v open >/dev/null 2>&1; then
+    open "$1" && ok "已在浏览器打开"
+  else
+    warn "找不到可用的浏览器，请手动访问上面的地址"
+  fi
+}
+
+# 有没有可用的 Chromium 系浏览器（支持 app 窗口 + 本地调试端口）
+chromium_available() {
+  for a in Chromium "Google Chrome" "Microsoft Edge" "Brave Browser" "Arc" "Vivaldi"; do
+    if [ -d "/Applications/$a.app" ] || [ -d "$HOME/Applications/$a.app" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- 体检模式 ---
+if [ "$CHECK_ONLY" = 1 ]; then
+  say "${C_BLD}${APP_NAME} 环境体检${C_RST}"
+  say ""
+  say "  Node.js    : ${node_ver}$([ "$node_ok" = 1 ] && printf ' %s' "${C_GRN}(满足 >= 24.9)${C_RST}" || printf ' %s' "${C_RED}(需要 >= 24.9)${C_RST}")"
+  say "  node 路径  : $(command -v node 2>/dev/null || echo '未找到')"
+  say "  npx 路径   : $(command -v "$NPX_BIN" 2>/dev/null || echo 未找到)"
+  say "  安装包     : ${PKG_SPEC}"
+  localbin="$HOME/.dsh-web-launcher/pkg/node_modules/@deepseek-ai/dsh/lib/bin.js"
+  if [ -f "$localbin" ]; then say "  运行方式   : 本地安装（node 直跑）"; else say "  运行方式   : npx（首次启动会慢几秒）"; fi
+  say "  工作区     : ${WORKSPACE}"
+  say "  监听地址   : http://${HOST}:${PORT}"
+  if port_open "$PORT"; then
+    code="$(http_code "$HOST" "$PORT")"
+    if is_dsh_service "$HOST" "$PORT" "$code"; then
+      say "  端口 ${PORT}   : 已有 DSH Web 在运行（HTTP ${code}）"
+    else
+      say "  端口 ${PORT}   : 被其它程序占用（HTTP ${code}），启动时会自动换端口"
+    fi
+  else
+    say "  端口 ${PORT}   : 空闲"
+  fi
+  say "  日志目录   : ${DSH_WEB_LOG_DIR:-$HOME/.dsh-web-launcher/logs}"
+  say ""
+  [ "$node_ok" = 1 ] && ok "环境可用，直接双击启动即可。" || warn "建议先升级 Node.js 到 24.9 或更高版本。"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- 开跑 ------
+say ""
+say "${C_BLD}${APP_NAME}${C_RST} ${C_DIM}v${VERSION}${C_RST}"
+say "${C_DIM}等价于：npx ${PKG_SPEC} web${C_RST}"
+say ""
+
+[ "$have_node" = 1 ] || die "没有找到 node。请先安装 Node.js 24.9 或更高版本：https://nodejs.org/"
+command -v "$NPX_BIN" >/dev/null 2>&1 || die "没有找到 npx（通常随 Node.js 一起安装）。"
+if [ "$node_ok" != 1 ]; then
+  warn "当前 Node.js ${node_ver} 低于 DSH 要求的 24.9，可能会启动失败。"
+  warn "升级办法：nvm install 24 && nvm alias default 24"
+  sleep 3
+fi
+
+[ -d "$WORKSPACE" ] || die "工作区不存在：$WORKSPACE"
+WORKSPACE="$(cd "$WORKSPACE" && pwd)"
+
+# 日志
+LOG_DIR="${DSH_WEB_LOG_DIR:-$HOME/.dsh-web-launcher/logs}"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+  LOG_DIR="$PWD/.dsh-web-logs"
+  mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="/tmp"
+fi
+LOG_FILE="$LOG_DIR/web-$(date +%Y%m%d-%H%M%S).log"
+: > "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
+
+# 往日志里打时间戳，方便看每个阶段耗时
+mark() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE" 2>/dev/null; }
+
+# 已经有一个跑着的？直接开浏览器，不重复起实例。
+if [ "$REUSE" = 1 ] && port_open "$PORT"; then
+  code="$(http_code "$HOST" "$PORT")"
+  if is_dsh_service "$HOST" "$PORT" "$code"; then
+    ok "检测到已有实例在运行：http://$HOST:$PORT"
+    say "${C_DIM}（浏览器若提示需要认证，请用上次 dsh web 打印的带 token 链接打开一次）${C_RST}"
+    open_browser "http://$HOST:$PORT"
+    sleep 1
+    exit 0
+  fi
+  warn "端口 $PORT 被其它程序占用（HTTP ${code}），自动换一个空闲端口…"
+  PORT="$(free_port $((PORT + 1)))" || die "找不到可用端口，请用 --port 指定。"
+  info "改用端口 $PORT"
+fi
+
+say "${C_DIM}工作区：${WORKSPACE}${C_RST}"
+say "${C_DIM}日志：  ${LOG_FILE}${C_RST}"
+say ""
+
+SERVER_PID=''
+STOPPING=0
+
+# 递归干掉整棵进程树：npx 下面还挂着 dsh，只杀 npx 会留下孤儿进程占着端口
+kill_tree() {
+  local pid="$1" sig="${2:-TERM}" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$child" "$sig"
+  done
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  STOPPING=1
+  # 启动还没完成就被叫停：让进度页显示失败，而不是一直转圈
+  if [ -n "$READY_FILE" ] && [ ! -s "$READY_FILE" ]; then
+    printf 'ERR:启动没有完成（可能被取消），详情见 ~/.dsh-web-launcher/last-run.log' > "$READY_FILE" 2>/dev/null
+  fi
+  if [ -n "$PAGE_PID" ]; then
+    # 留 15 秒给浏览器读一次错误，再收掉进度页
+    ( sleep 15; kill "$PAGE_PID" 2>/dev/null ) >/dev/null 2>&1 &
+    PAGE_PID=''
+  fi
+  [ -n "$SERVER_PID" ] || return 0
+  kill -0 "$SERVER_PID" 2>/dev/null || return 0
+  kill_tree "$SERVER_PID" TERM
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 0.2
+  done
+  kill_tree "$SERVER_PID" KILL
+}
+trap cleanup EXIT INT TERM HUP
+
+cd "$WORKSPACE" || die "进不去工作区：$WORKSPACE"
+
+# 先开一个「正在启动」的进度页：就绪前也有反馈，就绪后自动跳转
+PAGE_PID=''
+PAGE_PORT=''
+READY_FILE=''
+BOOT_PAGE=0
+if [ "$NO_OPEN" != 1 ] && [ "${DSH_WEB_BOOT_PAGE:-1}" = 1 ] && command -v node >/dev/null 2>&1; then
+  PAGE_PORT="$(free_port $((PORT + 100)) 2>/dev/null)" || PAGE_PORT=''
+  if [ -n "$PAGE_PORT" ]; then
+    READY_FILE="$LOG_DIR/.ready-$$"
+    rm -f "$READY_FILE"
+    node "$SELF_DIR/dsh-boot-page" "$PAGE_PORT" "$READY_FILE" >/dev/null 2>&1 &
+    PAGE_PID=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      curl -sS -m 1 -o /dev/null "http://127.0.0.1:$PAGE_PORT/status" 2>/dev/null && break
+      sleep 0.2
+    done
+    if DSH_OPEN_MATCH="127.0.0.1:$PORT" "$SELF_DIR/dsh-open" "http://127.0.0.1:$PAGE_PORT/" >/dev/null 2>&1; then
+      BOOT_PAGE=1
+      info "已打开进度页（${C_DIM}http://127.0.0.1:${PAGE_PORT}/${C_RST}），就绪后自动跳转"
+    fi
+  fi
+fi
+
+export npm_config_yes=true
+export npm_config_update_notifier=false
+
+LOCAL_PKG_DIR="${DSH_WEB_PKG_DIR:-$HOME/.dsh-web-launcher/pkg}"
+LOCAL_BIN="$LOCAL_PKG_DIR/node_modules/@deepseek-ai/dsh/lib/bin.js"
+
+# npx 每次都要问一次 registry（实测 ~6 秒），所以第一次装到本地，之后直接 node 跑
+if [ ! -f "$LOCAL_BIN" ] && [ "${DSH_WEB_LOCAL_PKG:-1}" = 1 ] && command -v npm >/dev/null 2>&1; then
+  info "首次准备本地运行环境（只做一次，之后启动会快很多）…"
+  npm install --prefix "$LOCAL_PKG_DIR" --no-fund --no-audit --loglevel=error \
+    --prefer-offline "$PKG_SPEC" >> "$LOG_FILE" 2>&1 || true
+fi
+
+if [ -f "$LOCAL_BIN" ]; then
+  info "启动中（本地版本，最多等 ${BOOT_TIMEOUT} 秒）…"
+  node "$LOCAL_BIN" web --host "$HOST" --port "$PORT" --no-open >> "$LOG_FILE" 2>&1 &
+else
+  info "启动中（经 npx，首次运行要下载依赖，最多等 ${BOOT_TIMEOUT} 秒）…"
+  "$NPX_BIN" -y "$PKG_SPEC" web --host "$HOST" --port "$PORT" --no-open >> "$LOG_FILE" 2>&1 &
+fi
+SERVER_PID=$!
+mark "dsh 已拉起"
+
+clear_progress() {
+  [ -t 1 ] && printf '\r\033[K'
+  return 0
+}
+
+# 等真正能访问了再开浏览器
+start_ts=$(date +%s)
+last_note=$start_ts
+web_url=''
+code=''
+while :; do
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    wait "$SERVER_PID" 2>/dev/null
+    rc=$?
+    clear_progress
+    if [ "$STOPPING" = 1 ]; then
+      echo
+      ok "已停止。"
+      exit 0
+    fi
+    die "启动失败（退出码 ${rc}）。日志尾部：
+$(tail -n 25 "$LOG_FILE" 2>/dev/null)"
+  fi
+
+  [ -n "$web_url" ] || web_url="$(printed_url "$LOG_FILE")"
+  code="$(http_code "$HOST" "$PORT")"
+
+  # 抓到了带 token 的地址，且端口已经能连上 → 就绪
+  if [ "$code" != '000' ] && [ -n "$web_url" ]; then break; fi
+  # 兜底：服务已响应但迟迟没打印地址（比如自己改过 printUrl）
+  if [ "$code" != '000' ] && [ $(( $(date +%s) - start_ts )) -ge 10 ]; then
+    clear_progress
+    warn "没有从日志里抓到带 token 的地址，改用普通地址打开。"
+    web_url="http://$HOST:$PORT"
+    break
+  fi
+
+  now=$(date +%s)
+  if [ $((now - start_ts)) -ge "$BOOT_TIMEOUT" ]; then
+    clear_progress
+    die "等待 ${BOOT_TIMEOUT} 秒仍未就绪，已放弃。日志：${LOG_FILE}"
+  fi
+  if [ -t 1 ] && [ $((now - last_note)) -ge 2 ]; then
+    printf '\r\033[K  %s等待服务就绪… %ss%s' "$C_DIM" "$((now - start_ts))" "$C_RST"
+    last_note=$now
+  fi
+  sleep 0.5
+done
+
+clear_progress
+echo
+mark "服务就绪"
+ok "服务已就绪（HTTP ${code}）"
+say "  地址：${C_BLD}${web_url}${C_RST}"
+say "${C_DIM}  （带 token 的地址只打印这一次，浏览器一次访问后会写入 cookie）${C_RST}"
+
+# 有 Chromium 时让它在进度页背后先把界面加载完，避免看到那几秒白屏/卡顿
+STAGED=0
+if [ "$BOOT_PAGE" = 1 ] && [ -x "$SELF_DIR/dsh-browser-stage" ] && chromium_available; then
+  STAGED=1
+fi
+
+if [ -n "$READY_FILE" ]; then
+  if [ "$STAGED" = 1 ]; then
+    printf 'STAGED|%s' "$web_url" > "$READY_FILE" 2>/dev/null
+  else
+    printf '%s' "$web_url" > "$READY_FILE" 2>/dev/null
+  fi
+fi
+
+if [ "$STAGED" = 1 ]; then
+  info "正在后台打开窗口，加载完成后自动切过去…"
+  DSH_OPEN_MATCH="127.0.0.1:$PORT" "$SELF_DIR/dsh-open" "$web_url" >/dev/null 2>&1
+  "$SELF_DIR/dsh-browser-stage" "${DSH_WEB_BROWSER_DEBUG_PORT:-9333}" "$PAGE_PORT" "$web_url" >/dev/null 2>&1 &
+elif [ "$BOOT_PAGE" = 1 ]; then
+  ok "进度页会自动跳转过去"
+else
+  open_browser "$web_url"
+fi
+echo
+say "${C_DIM}────────────────────────────────────────────${C_RST}"
+say "  窗口关掉或按 ${C_BLD}Ctrl-C${C_RST} 即停止服务"
+say "  日志：${LOG_FILE}"
+say "${C_DIM}────────────────────────────────────────────${C_RST}"
+echo
+
+wait "$SERVER_PID"
+rc=$?
+echo
+if [ "$rc" -eq 0 ] || [ "$rc" -ge 128 ]; then
+  ok "已停止。"
+else
+  warn "服务退出（退出码 ${rc}），日志：${LOG_FILE}"
+fi
+exit "$rc"

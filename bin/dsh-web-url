@@ -1,0 +1,16 @@
+#!/bin/bash
+# 打印最近一次 dsh web 启动时给出的“带 token 的地址”，抓不到就退回普通地址。
+# 供 app 的「再次点击图标 → 重新打开页面」使用。
+HOST="${DSH_WEB_HOST:-127.0.0.1}"
+PORT="${DSH_WEB_PORT:-3080}"
+LOG_DIR="${DSH_WEB_LOG_DIR:-$HOME/.dsh-web-launcher/logs}"
+
+latest="$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -1)"
+if [ -n "$latest" ]; then
+  url="$(sed -n 's/^[[:space:]]*dsh web:[[:space:]]*\(http[^[:space:]]*\).*/\1/p' "$latest" 2>/dev/null | tail -1)"
+  if [ -n "$url" ]; then
+    printf '%s' "$url"
+    exit 0
+  fi
+fi
+printf 'http://%s:%s' "$HOST" "$PORT"

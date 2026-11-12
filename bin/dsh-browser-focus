@@ -1,0 +1,69 @@
+#!/usr/bin/env node
+// 通过 Chromium 的本地调试端口操作“我们自己的”窗口：
+//   * 已经有窗口在显示目标页面 → 只把它提到前面
+//   * 有窗口显示着同一个服务（match 命中）→ 在它里面导航到目标页面
+//   * 都没有 → 退出码 1，让调用方新开窗口
+//
+// 用法：dsh-browser-focus <debugPort> <targetUrl> [match...]
+const port = process.argv[2]
+const target = process.argv[3]
+let matches = process.argv.slice(4).filter(Boolean)
+if (matches.length === 0) matches = [originOf(target)]
+
+function originOf(u) {
+  const m = /^[a-zA-Z]+:\/\/([^/]+)/.exec(u || '')
+  return m ? m[1] : ''
+}
+
+async function cdp(wsUrl, calls) {
+  const ws = new WebSocket(wsUrl)
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), 3000)
+    ws.onopen = () => {
+      clearTimeout(timer)
+      let next = 1
+      const send = (method, params) => ws.send(JSON.stringify({ id: next++, method, params }))
+      for (const [method, params] of calls) send(method, params)
+      setTimeout(() => {
+        ws.close()
+        resolve()
+      }, 300)
+    }
+    ws.onerror = () => {
+      clearTimeout(timer)
+      reject(new Error('ws error'))
+    }
+  })
+}
+
+const main = async () => {
+  let targets
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) })
+    targets = await res.json()
+  } catch {
+    process.exit(1)
+  }
+
+  const pages = (targets || []).filter((t) => t.type === 'page')
+  const page = pages.find((t) => matches.some((m) => (t.url || '').includes(m)))
+  if (!page) process.exit(1)
+
+  if (page.url === target) {
+    await fetch(`http://127.0.0.1:${port}/json/activate/${page.id}`).catch(() => {})
+    process.exit(0)
+  }
+
+  try {
+    await cdp(`ws://127.0.0.1:${port}/devtools/page/${page.id}`, [
+      ['Page.navigate', { url: target }],
+      ['Page.bringToFront', {}],
+    ])
+  } catch {
+    // 导航失败就退回“激活”，至少不新开窗口
+    await fetch(`http://127.0.0.1:${port}/json/activate/${page.id}`).catch(() => {})
+  }
+  process.exit(0)
+}
+
+main()
