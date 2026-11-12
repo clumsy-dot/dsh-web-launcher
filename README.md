@@ -4,6 +4,12 @@
 
 [English](README.en.md)
 
+## 下载
+
+不想自己构建的话，去 [Releases](https://github.com/clumsy-dot/dsh-web-launcher/releases) 下载 `DSH-Web-2.1.0-macos.zip`，解压后把 `DSH Web.app` 拖进「应用程序」即可。
+
+> 发布包为本地 ad-hoc 签名、未经 Apple 公证，首次打开可能被 Gatekeeper 拦截：右键 → 打开，或到「系统设置 → 隐私与安全性」里放行。
+
 ## 特性
 
 | | |
@@ -30,7 +36,7 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/<you>/dsh-web-launcher.git
+git clone https://github.com/clumsy-dot/dsh-web-launcher.git
 cd dsh-web-launcher
 
 ./build-app.sh      # 编译 AppleScript 入口并生成图标
@@ -124,6 +130,10 @@ rm -rf "/Applications/DSH Web.app" ~/.dsh-web-launcher
 - 脚本输出与注释为中文；欢迎提交英文文案的 PR。
 - 没有做公证（notarization），本地 ad-hoc 签名，自用足够。
 - 启动器给 Chromium 开了一个本地调试端口（默认 `9333`，只监听 `127.0.0.1`），用来定位和切换自己的窗口；可用 `DSH_WEB_BROWSER_DEBUG_PORT` 改端口。
+
+## 免责声明
+
+本项目与 DeepSeek 官方无关，按「现状」提供、不附带任何担保；启动器只在本机运行，不收集也不上传你的数据。完整条款见 [DISCLAIMER.md](DISCLAIMER.md)。
 
 ## License
 

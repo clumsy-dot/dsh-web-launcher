@@ -6,6 +6,12 @@ Double‑click an app in `/Applications`, get a dedicated browser window pointed
 
 [中文说明](README.md)
 
+## Download
+
+Prefer not to build? Grab `DSH-Web-2.1.0-macos.zip` from [Releases](https://github.com/clumsy-dot/dsh-web-launcher/releases), unzip it, and drag `DSH Web.app` into `/Applications`.
+
+> Release builds are ad-hoc signed and not notarized by Apple, so Gatekeeper may block the first launch (right-click → Open, or allow it in System Settings).
+
 ## Features
 
 | | |
@@ -32,7 +38,7 @@ Double‑click an app in `/Applications`, get a dedicated browser window pointed
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/dsh-web-launcher.git
+git clone https://github.com/clumsy-dot/dsh-web-launcher.git
 cd dsh-web-launcher
 
 ./build-app.sh      # compiles the AppleScript applet and builds the icon
@@ -126,6 +132,10 @@ rm -rf "/Applications/DSH Web.app" ~/.dsh-web-launcher
 - Script output is in Chinese; the code is commented in Chinese too. PRs adding English messages are welcome.
 - Not notarized: the app is ad‑hoc signed locally, which is fine for personal use.
 - The launcher opens a local Chromium debugging port (default `9333`, loopback only) to find and focus its own windows; override with `DSH_WEB_BROWSER_DEBUG_PORT`.
+
+## Disclaimer
+
+Unofficial project, provided “as is” without warranty. The launcher runs locally and never collects or uploads your data. See [DISCLAIMER.md](DISCLAIMER.md) for the full text.
 
 ## License
 
